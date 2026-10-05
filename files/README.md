@@ -1,155 +1,41 @@
-# Monitor de acceso a archivos con eBPF y Python
+# Monitor de intentos de apertura de archivos con eBPF
 
-Este proyecto es un ejemplo sencillo de cómo utilizar **eBPF desde Python** para observar qué archivos están intentando abrir los procesos de un sistema Linux.
+Este proyecto observa llamadas al tracepoint `sys_enter_openat` del kernel de
+Linux. Cada vez que un proceso entra a `openat`, el programa eBPF obtiene el
+PID del proceso, su nombre corto y la cadena de ruta que el proceso pasó como
+argumento `filename`. Después envía esos datos a un programa Python, que los
+imprime en la terminal.
 
-El programa utiliza:
+Es un monitor de **intentos de apertura**, no una auditoría de accesos
+completados: el evento se captura al entrar al syscall, antes de conocer su
+resultado. Por tanto, una línea no garantiza que el archivo exista, que se
+haya abierto correctamente ni que luego se haya leído o escrito.
 
-* **Python** para ejecutar y recibir los eventos.
-* **BCC (BPF Compiler Collection)** como herramienta para trabajar con eBPF.
-* **C** para escribir el programa eBPF que se ejecutará dentro del kernel de Linux.
-* Un **tracepoint** del kernel para detectar llamadas al sistema `openat()`.
+## Componentes
 
-El resultado será algo parecido a:
+| Archivo | Responsabilidad |
+| --- | --- |
+| `files_access.c` | Define el programa eBPF y captura los datos de cada entrada a `openat`. |
+| `monitor.py` | Compila y carga el programa mediante BCC, recibe eventos y los imprime. |
 
-```text
-PID     COMMAND         FILE
---------------------------------------------------------------------------------
-1254    bash            /etc/bash.bashrc
-1254    bash            /home/ramon/test.txt
-1821    python3         /tmp/data.json
-1934    cat             /etc/hosts
-1934    cat             /home/ramon/document.txt
-```
+## Recorrido completo de un evento
 
-La idea principal del proyecto es entender cómo podemos utilizar eBPF para observar lo que ocurre dentro del kernel desde una aplicación Python.
+1. Python lee `files_access.c` desde el directorio de trabajo actual.
+2. `BPF(text=program)` pide a BCC que compile el código C y lo cargue en el
+   kernel.
+3. La macro `TRACEPOINT_PROBE(syscalls, sys_enter_openat)` de BCC conecta la
+   función eBPF al tracepoint de entrada al syscall `openat`.
+4. Cuando un proceso invoca `openat`, el kernel ejecuta el programa eBPF.
+5. El programa obtiene el TGID del proceso, copia su nombre corto y lee la
+   cadena de ruta desde el espacio de memoria de usuario del proceso.
+6. `events.perf_submit()` envía el evento por el buffer de rendimiento `events`.
+7. Python mantiene abierto ese buffer; cuando llega un evento, BCC invoca
+   `print_event()`, que interpreta los bytes como una estructura `Event` y
+   escribe una fila en la terminal.
 
----
+## Código eBPF en `files_access.c`
 
-# 1. ¿Qué es eBPF?
-
-Antes de ver el código, es importante entender qué problema estamos intentando resolver.
-
-Linux tiene un kernel que se encarga de muchas operaciones del sistema:
-
-* procesos
-* memoria
-* archivos
-* red
-* dispositivos
-* llamadas al sistema
-* etc.
-
-Cuando un programa quiere hacer algo, normalmente tiene que pedirle al kernel que lo haga.
-
-Por ejemplo, cuando ejecutamos:
-
-```bash
-cat test.txt
-```
-
-el programa `cat` necesita abrir el archivo.
-
-Internamente termina realizando una llamada al sistema, conocida como:
-
-```text
-openat()
-```
-
-Podemos imaginarlo de forma simplificada así:
-
-```text
-cat
- |
- | openat("test.txt")
- v
-Linux Kernel
- |
- | abre el archivo
- v
-Filesystem
-```
-
-eBPF nos permite colocar pequeños programas dentro de determinados puntos del kernel para observar qué está ocurriendo.
-
-En este proyecto vamos a colocar nuestro programa eBPF en:
-
-```text
-sys_enter_openat
-```
-
-Esto significa:
-
-> "Ejecuta nuestro programa eBPF cada vez que un proceso entra al syscall `openat()`."
-
----
-
-# 2. ¿Qué es BCC?
-
-BCC significa:
-
-```text
-BPF Compiler Collection
-```
-
-BCC proporciona herramientas y librerías que hacen mucho más sencillo trabajar con eBPF.
-
-En este proyecto utilizamos BCC desde Python:
-
-```python
-from bcc import BPF
-```
-
-Esto nos permite hacer cosas como:
-
-```python
-b = BPF(text=program)
-```
-
-Aquí BCC toma nuestro programa escrito en C, lo prepara para eBPF y lo carga en el kernel.
-
-Por eso tenemos dos lenguajes:
-
-```text
-Python
-   |
-   | controla el programa
-   |
-   v
-BCC
-   |
-   | carga
-   v
-eBPF escrito en C
-   |
-   v
-Linux Kernel
-```
-
-Python es nuestra aplicación.
-
-C es el programa que realmente observa los eventos dentro del kernel.
-
----
-
-# 3. Estructura del proyecto
-
-Podemos tener solamente dos archivos:
-
-```text
-file-monitor/
-├── monitor.py
-└── files_access.c
-```
-
-`monitor.py` contiene el programa Python.
-
-`files_access.c` contiene el programa eBPF.
-
----
-
-# 4. El programa eBPF
-
-Nuestro archivo `files_access.c` contiene:
+### Encabezado y formato del evento
 
 ```c
 #include <uapi/linux/ptrace.h>
@@ -159,472 +45,63 @@ struct event_t {
     char comm[64];
     char filename[256];
 };
-
-BPF_PERF_OUTPUT(events);
-
-TRACEPOINT_PROBE(syscalls, sys_enter_openat)
-{
-    struct event_t event = {};
-
-    event.pid = bpf_get_current_pid_tgid() >> 32;
-
-    bpf_get_current_comm(
-        &event.comm,
-        sizeof(event.comm)
-    );
-
-    bpf_probe_read_user_str(
-        &event.filename,
-        sizeof(event.filename),
-        args->filename
-    );
-
-    events.perf_submit(
-        args,
-        &event,
-        sizeof(event)
-    );
-
-    return 0;
-}
 ```
 
-Ahora vamos a analizarlo parte por parte.
+- El encabezado proporciona definiciones usadas por los programas BPF y por
+  las macros de instrumentación de BCC.
+- `struct event_t` establece el formato binario compartido con Python:
+  - `pid`: entero sin signo de 32 bits.
+  - `comm`: arreglo de 64 bytes para el nombre corto del proceso.
+  - `filename`: arreglo de 256 bytes para la ruta recibida en `openat`.
+- El orden y el tamaño de estos campos deben coincidir con los declarados en
+  la clase Python `Event`. Actualmente coinciden: 4 + 64 + 256 bytes.
+- El evento se inicializa a cero antes de rellenarse. Esto deja en cero los
+  bytes restantes de los arreglos cuando las cadenas son más cortas.
 
----
-
-# 5. Incluir las definiciones necesarias
-
-La primera línea es:
-
-```c
-#include <uapi/linux/ptrace.h>
-```
-
-Estamos incluyendo definiciones que BCC necesita para trabajar con los programas eBPF.
-
-No estamos escribiendo un programa C tradicional que se ejecuta como:
-
-```bash
-./programa
-```
-
-Este C será procesado por BCC y convertido en un programa eBPF que será ejecutado por el kernel.
-
----
-
-# 6. La estructura `event_t`
-
-Tenemos:
-
-```c
-struct event_t {
-    u32 pid;
-    char comm[64];
-    char filename[256];
-};
-```
-
-Esta estructura define la información que queremos enviar desde el kernel hacia Python.
-
-Podemos pensar en ella como un pequeño mensaje.
-
-Cada vez que ocurre un `openat()`, queremos enviar:
-
-```text
-PID
-nombre del proceso
-nombre del archivo
-```
-
-Por ejemplo:
-
-```text
-PID:      1234
-COMMAND:  cat
-FILE:     /home/ramon/test.txt
-```
-
-La estructura representa esos datos:
-
-```text
-event_t
-│
-├── pid
-├── comm
-└── filename
-```
-
----
-
-# 7. El PID
-
-Tenemos:
-
-```c
-u32 pid;
-```
-
-`u32` significa un entero sin signo de 32 bits.
-
-Aquí almacenaremos el PID del proceso que realizó el `openat()`.
-
-Por ejemplo:
-
-```text
-1234
-```
-
----
-
-# 8. El nombre del proceso
-
-Tenemos:
-
-```c
-char comm[64];
-```
-
-`char` representa caracteres.
-
-El `[64]` significa que reservamos espacio para hasta 64 caracteres.
-
-Aquí guardaremos el nombre del proceso.
-
-Por ejemplo:
-
-```text
-bash
-python3
-cat
-vim
-firefox
-```
-
-Es importante entender que `comm` normalmente contiene el nombre corto del proceso, no necesariamente el comando completo.
-
-Por ejemplo:
-
-```text
-python3
-```
-
-y no necesariamente:
-
-```text
-python3 my_script.py --verbose
-```
-
----
-
-# 9. El nombre del archivo
-
-Tenemos:
-
-```c
-char filename[256];
-```
-
-Aquí reservamos espacio para almacenar el nombre o path del archivo.
-
-Por ejemplo:
-
-```text
-/etc/hosts
-```
-
-o:
-
-```text
-/home/ramon/test.txt
-```
-
-El tamaño máximo que estamos guardando en este ejemplo es de 256 bytes.
-
----
-
-# 10. `BPF_PERF_OUTPUT`
-
-Después tenemos:
+### Canal de eventos
 
 ```c
 BPF_PERF_OUTPUT(events);
 ```
 
-Esta línea es muy importante.
+Declara un buffer de rendimiento llamado `events`. El nombre debe coincidir
+con el que Python utiliza en `b["events"]`. Este mecanismo transporta registros
+desde el contexto del kernel hasta el proceso de usuario; no escribe archivos
+ni imprime directamente desde eBPF.
 
-Nuestro programa eBPF está ejecutándose dentro del kernel.
-
-Pero nosotros queremos mostrar los resultados en Python.
-
-Necesitamos algún mecanismo para transportar información:
-
-```text
-Kernel
-   |
-   | evento
-   v
-Python
-```
-
-`BPF_PERF_OUTPUT` crea un mecanismo para enviar eventos desde eBPF hacia el programa que está utilizando BCC.
-
-En nuestro caso lo llamamos:
-
-```text
-events
-```
-
-Por eso posteriormente en Python podemos hacer:
-
-```python
-b["events"]
-```
-
-Estamos accediendo al mismo objeto que declaramos en C:
-
-```c
-BPF_PERF_OUTPUT(events);
-```
-
----
-
-# 11. El tracepoint
-
-Ahora llegamos a una de las partes más importantes:
+### Hook de entrada a `openat`
 
 ```c
 TRACEPOINT_PROBE(syscalls, sys_enter_openat)
 ```
 
-Esto le dice a BCC que queremos ejecutar nuestro programa cuando ocurra el tracepoint:
+BCC genera y conecta el programa al tracepoint de entrada del syscall
+`openat`. El parámetro `args` que BCC proporciona a la función contiene los
+campos del tracepoint, entre ellos `filename`, el puntero a la cadena que el
+proceso solicitó abrir.
 
-```text
-syscalls:sys_enter_openat
-```
+El hook se ejecuta al entrar al syscall. No espera a la salida de `openat` y
+por ello no conoce el descriptor de archivo ni el código de error o éxito.
 
-Un tracepoint es un punto de instrumentación que el kernel proporciona para que podamos observar determinados eventos.
-
-En este caso:
-
-```text
-syscalls
-   |
-   └── sys_enter_openat
-```
-
-Significa:
-
-> Queremos observar cuando un proceso entra al syscall `openat()`.
-
----
-
-# 12. ¿Qué es `openat()`?
-
-Los programas normalmente no acceden directamente al filesystem.
-
-Utilizan syscalls para pedirle al kernel que realice determinadas operaciones.
-
-Por ejemplo:
-
-```text
-Programa
-   |
-   | openat()
-   v
-Kernel
-   |
-   v
-Filesystem
-```
-
-Cuando ejecutamos:
-
-```bash
-cat test.txt
-```
-
-`cat` necesita abrir `test.txt`.
-
-Una de las operaciones que puede utilizar es:
-
-```text
-openat()
-```
-
-Nuestro programa eBPF observa justamente ese momento.
-
----
-
-# 13. Los argumentos del tracepoint
-
-Dentro del programa tenemos:
-
-```c
-args->filename
-```
-
-`args` contiene los argumentos que el tracepoint proporciona.
-
-Para `sys_enter_openat`, uno de esos argumentos es el nombre del archivo que el proceso está intentando abrir.
-
-Conceptualmente podemos imaginar:
-
-```text
-args
-│
-├── dfd
-├── filename
-└── flags
-```
-
-Nos interesa:
-
-```c
-args->filename
-```
-
-porque contiene el puntero hacia el nombre del archivo que el proceso pasó al syscall.
-
----
-
-# 14. Crear un evento
-
-Dentro del programa hacemos:
+### Obtención de los datos del proceso
 
 ```c
 struct event_t event = {};
-```
 
-Estamos creando una instancia de nuestra estructura:
-
-```c
-event_t
-```
-
-La variable se llama:
-
-```text
-event
-```
-
-Inicializarla con:
-
-```c
-= {};
-```
-
-hace que sus campos comiencen inicializados en cero.
-
-Ahora tenemos un objeto vacío:
-
-```text
-event
-│
-├── pid       = 0
-├── comm      = ""
-└── filename  = ""
-```
-
-Vamos a llenarlo.
-
----
-
-# 15. Obtener el PID
-
-Tenemos:
-
-```c
 event.pid = bpf_get_current_pid_tgid() >> 32;
 ```
 
-Esta línea puede parecer complicada al principio.
-
-La función:
-
-```c
-bpf_get_current_pid_tgid()
-```
-
-nos proporciona información sobre el proceso y el thread group actual.
-
-Devuelve un valor de 64 bits.
-
-Conceptualmente podemos verlo como:
-
-```text
-63                     32 31                      0
-+------------------------+------------------------+
-|        TGID            |          PID           |
-+------------------------+------------------------+
-```
-
-Al hacer:
+`event = {}` inicializa los campos en cero. `bpf_get_current_pid_tgid()` devuelve
+un valor de 64 bits que contiene identificadores de proceso e hilo. Al
+desplazarlo 32 bits se obtiene el TGID, normalmente el PID visible del proceso
+(no el identificador individual de cada hilo).
 
 ```c
->> 32
+bpf_get_current_comm(&event.comm, sizeof(event.comm));
 ```
 
-desplazamos los bits 32 posiciones hacia la derecha para obtener la parte superior.
-
-En este contexto obtenemos el TGID, que normalmente corresponde al PID que queremos mostrar para el proceso.
-
-El resultado se guarda en:
-
-```c
-event.pid
-```
-
----
-
-# 16. Obtener el nombre del proceso
-
-Después hacemos:
-
-```c
-bpf_get_current_comm(
-    &event.comm,
-    sizeof(event.comm)
-);
-```
-
-`bpf_get_current_comm()` obtiene el nombre del proceso actual.
-
-Tenemos:
-
-```c
-&event.comm
-```
-
-que indica dónde queremos guardar el resultado.
-
-Y:
-
-```c
-sizeof(event.comm)
-```
-
-indica cuánto espacio tenemos disponible.
-
-Como declaramos:
-
-```c
-char comm[64];
-```
-
-tenemos espacio para 64 bytes.
-
-Después de esta operación podemos tener algo como:
-
-```text
-event.comm = "cat"
-```
-
----
-
-# 17. Leer el nombre del archivo
-
-Esta es probablemente la línea más importante del ejemplo:
+Copia a `comm` el nombre corto del proceso actual. No es una ruta al ejecutable
+y está limitado al tamaño del arreglo (64 bytes en este evento).
 
 ```c
 bpf_probe_read_user_str(
@@ -634,61 +111,18 @@ bpf_probe_read_user_str(
 );
 ```
 
-¿Por qué necesitamos una función especial para esto?
+Lee una cadena terminada en nulo desde la dirección de usuario indicada por
+`args->filename` y la copia a `event.filename`. Se limita a 256 bytes, incluido
+el terminador nulo cuando cabe. Una ruta más larga puede quedar truncada. El
+valor de retorno de esta lectura no se comprueba en el código, así que el
+programa no informa por separado de errores de lectura.
 
-Porque `args->filename` apunta a memoria perteneciente al proceso que realizó el syscall.
+La cadena es exactamente el argumento de ruta del syscall, no necesariamente
+una ruta absoluta resuelta. En particular, puede ser relativa y su resolución
+depende del directorio actual o del descriptor de directorio pasado a
+`openat`; el monitor no guarda ese descriptor ni resuelve la ruta final.
 
-No podemos simplemente hacer:
-
-```c
-event.filename = args->filename;
-```
-
-Eso no sería una lectura válida de la memoria del proceso.
-
-Necesitamos utilizar una función proporcionada para que eBPF pueda leer de forma segura una cadena desde memoria de usuario.
-
-Por eso utilizamos:
-
-```c
-bpf_probe_read_user_str()
-```
-
-Conceptualmente:
-
-```text
-Proceso
-   |
-   | filename
-   v
-memoria del proceso
-   |
-   | bpf_probe_read_user_str()
-   v
-event.filename
-```
-
-Después de esta operación podemos tener:
-
-```text
-event.filename = "/etc/hosts"
-```
-
----
-
-# 18. Enviar el evento a Python
-
-Una vez que tenemos:
-
-```text
-PID
-nombre del proceso
-nombre del archivo
-```
-
-necesitamos enviarlo a Python.
-
-Utilizamos:
+### Envío y retorno
 
 ```c
 events.perf_submit(
@@ -696,178 +130,55 @@ events.perf_submit(
     &event,
     sizeof(event)
 );
-```
 
-Esto envía nuestra estructura:
-
-```c
-event
-```
-
-a través del buffer que creamos anteriormente:
-
-```c
-BPF_PERF_OUTPUT(events);
-```
-
-Podemos visualizar todo el flujo así:
-
-```text
-Linux Kernel
-    |
-    |
-    | sys_enter_openat
-    v
-eBPF program
-    |
-    |
-    | crea event
-    v
-event_t
-    |
-    ├── pid
-    ├── comm
-    └── filename
-    |
-    v
-BPF_PERF_OUTPUT
-    |
-    v
-Python
-```
-
----
-
-# 19. `return 0`
-
-Al final tenemos:
-
-```c
 return 0;
 ```
 
-El programa eBPF termina y devuelve cero.
+`perf_submit` envía el evento completo al buffer `events`. La función devuelve
+cero y no altera el resultado de la operación de apertura. El código no
+captura el resultado del syscall ni diferencia entre apertura de lectura,
+escritura, creación u otros modos.
 
-En este caso simplemente estamos indicando que terminamos correctamente.
+## Código Python en `monitor.py`
 
----
-
-# 20. El programa Python
-
-Ahora podemos observar el otro lado.
-
-Nuestro `monitor.py` contiene:
+### Importaciones y carga del programa
 
 ```python
 from bcc import BPF
 import ctypes as ct
 ```
 
----
-
-# 21. Importar BCC
-
-Tenemos:
-
-```python
-from bcc import BPF
-```
-
-`BPF` es la clase principal que utilizamos para cargar y trabajar con nuestro programa eBPF.
-
----
-
-# 22. Importar ctypes
-
-Tenemos:
-
-```python
-import ctypes as ct
-```
-
-Necesitamos `ctypes` porque los datos que vienen desde C tienen una estructura binaria.
-
-Python necesita saber cómo interpretar esos bytes.
-
-Por ejemplo, C tiene:
-
-```c
-u32 pid;
-```
-
-y Python necesita saber:
-
-```python
-ct.c_uint
-```
-
-para interpretar correctamente esos datos.
-
----
-
-# 23. Leer el programa C
-
-Tenemos:
+- `BPF` es la interfaz de BCC usada para compilar y cargar el código eBPF.
+- `ctypes` permite describir en Python la estructura de bytes definida en C.
 
 ```python
 with open("files_access.c") as f:
     program = f.read()
-```
 
-Aquí simplemente abrimos nuestro archivo:
-
-```text
-files_access.c
-```
-
-y lo cargamos como texto en Python.
-
-Por ejemplo:
-
-```python
-program
-```
-
-contendrá todo nuestro código C.
-
----
-
-# 24. Crear el programa BPF
-
-Después:
-
-```python
 b = BPF(text=program)
 ```
 
-Esta es una de las líneas más importantes de Python.
+El archivo C se abre usando una ruta relativa al directorio de trabajo actual,
+no relativa automáticamente a la ubicación de `monitor.py`. Luego BCC compila
+el texto, carga el programa y procesa la macro del tracepoint. Los errores de
+compilación, permisos o carga se producirán al construir `BPF`.
 
-Estamos entregando el código C a BCC.
+### Kprobe comentado
 
-BCC se encarga de preparar y cargar el programa eBPF.
-
-Conceptualmente:
-
-```text
-files_access.c
-      |
-      v
-    Python
-      |
-      v
-     BCC
-      |
-      v
-   eBPF/kernel
+```python
+#b.attach_kprobe(
+#    event="__x64_sys_openat",
+#    fn_name="trace_open"
+#)
 ```
 
----
+Este bloque está comentado y no se ejecuta. Muestra una alternativa basada en
+un kprobe, pero el programa C actual no define una función llamada
+`trace_open`. La instrumentación activa es el tracepoint declarado en C,
+`sys_enter_openat`; ese tracepoint no requiere llamar a `attach_kprobe()` desde
+Python.
 
-# 25. La estructura Python
-
-Ahora necesitamos definir en Python exactamente cómo interpretar el evento que viene desde C.
-
-Tenemos:
+### Estructura que interpreta el evento
 
 ```python
 class Event(ct.Structure):
@@ -878,624 +189,110 @@ class Event(ct.Structure):
     ]
 ```
 
-Esta estructura debe corresponder con la estructura C:
+`Event` refleja los campos de `struct event_t` en el mismo orden y con los
+mismos tamaños. `ct.c_uint` corresponde al `u32` de C en la plataforma Linux
+habitual. `ct.c_char * 64` y `ct.c_char * 256` representan los dos arreglos de
+caracteres. Mantener estas definiciones sincronizadas es esencial: si cambia el
+formato en C, también debe cambiar la estructura de Python.
 
-```c
-struct event_t {
-    u32 pid;
-    char comm[64];
-    char filename[256];
-};
-```
-
-Es muy importante que ambas estructuras tengan el mismo orden y tamaños compatibles.
-
-C:
-
-```text
-pid
-comm
-filename
-```
-
-Python:
-
-```text
-pid
-comm
-filename
-```
-
----
-
-# 26. Correspondencia entre C y Python
-
-Podemos verlo así:
-
-| C           | Python            |
-| ----------- | ----------------- |
-| `u32`       | `ct.c_uint`       |
-| `char[64]`  | `ct.c_char * 64`  |
-| `char[256]` | `ct.c_char * 256` |
-
-Esta correspondencia permite que Python interprete correctamente los bytes enviados desde el kernel.
-
----
-
-# 27. La función `print_event`
-
-Tenemos:
+### Callback e impresión
 
 ```python
 def print_event(cpu, data, size):
+    event = ct.cast(
+        data,
+        ct.POINTER(Event)
+    ).contents
 ```
 
-Esta función será llamada cada vez que llegue un evento desde eBPF.
-
-BCC nos proporciona:
-
-```text
-cpu
-data
-size
-```
-
-El parámetro más importante para nosotros es:
+BCC llama a esta función cuando recibe un evento. `data` apunta a los bytes
+enviados desde C; `ct.cast(...).contents` los interpreta como una instancia de
+`Event`. Los argumentos `cpu` y `size` los proporciona BCC, pero el código no
+los consulta ni valida el tamaño recibido.
 
 ```python
-data
+    comm = event.comm.decode(errors="replace")
+    filename = event.filename.decode(errors="replace")
 ```
 
-porque contiene los datos enviados por:
-
-```c
-events.perf_submit(...)
-```
-
----
-
-# 28. Convertir los datos a nuestra estructura
-
-Tenemos:
+Los arreglos de bytes se decodifican como texto. `errors="replace"` evita que
+una secuencia de bytes no válida interrumpa la impresión y la reemplaza por un
+carácter de sustitución.
 
 ```python
-event = ct.cast(
-    data,
-    ct.POINTER(Event)
-).contents
+    print(
+        f"{event.pid:<7} "
+        f"{comm:<15} "
+        f"{filename}"
+    )
 ```
 
-Aquí estamos diciendo:
+Imprime PID, comando y ruta en columnas. `<7` y `<15` alinean los dos primeros
+valores a la izquierda con el ancho indicado; la ruta se imprime después, sin
+un ancho fijo.
 
-> "Interpreta los bytes recibidos como una estructura `Event`."
-
-Después podemos acceder directamente a:
-
-```python
-event.pid
-event.comm
-event.filename
-```
-
----
-
-# 29. Convertir `comm`
-
-Tenemos:
-
-```python
-comm = event.comm.decode(errors="replace")
-```
-
-Desde C recibimos:
-
-```c
-char comm[64]
-```
-
-Eso son bytes.
-
-Python necesita convertir esos bytes a un `str`.
-
-Por eso utilizamos:
-
-```python
-.decode()
-```
-
-Por ejemplo:
-
-```text
-b"bash"
-```
-
-se convierte en:
-
-```text
-"bash"
-```
-
----
-
-# 30. Convertir `filename`
-
-Hacemos exactamente lo mismo:
-
-```python
-filename = event.filename.decode(errors="replace")
-```
-
-Convertimos los bytes recibidos desde C a un string de Python.
-
-Por ejemplo:
-
-```text
-b"/etc/hosts"
-```
-
-se convierte en:
-
-```text
-"/etc/hosts"
-```
-
----
-
-# 31. Mostrar el resultado
-
-Finalmente:
-
-```python
-print(
-    f"{event.pid:<7} "
-    f"{comm:<15} "
-    f"{filename}"
-)
-```
-
-Esto simplemente imprime los datos en columnas.
-
-Por ejemplo:
-
-```text
-1234    bash            /etc/bash.bashrc
-```
-
-Los valores:
-
-```text
-<7
-<15
-```
-
-son solamente formato para mantener las columnas alineadas.
-
----
-
-# 32. Conectar Python con `events`
-
-Ahora tenemos:
+### Registro del buffer y ciclo de espera
 
 ```python
 b["events"].open_perf_buffer(print_event)
 ```
 
-Recuerda que en C tenemos:
+Busca el buffer `events` declarado en C y registra `print_event` como callback
+para los eventos que lleguen.
 
-```c
-BPF_PERF_OUTPUT(events);
-```
+El programa imprime un mensaje y una cabecera de columnas. El mensaje
+`Watching file access...` aparece dos veces en el código actual. Después llama
+a `b.perf_buffer_poll()` una vez y entra en un bucle que vuelve a llamar a la
+misma función. Cada llamada espera y procesa eventos; al pulsar `Ctrl+C`,
+`KeyboardInterrupt` rompe el bucle y finaliza el script.
 
-Por eso en Python podemos acceder a:
+## Requisitos y ejecución
 
-```python
-b["events"]
-```
+- Linux con BCC instalado y sus bindings para Python disponibles.
+- Permisos suficientes para cargar programas eBPF y leer el tracepoint
+  (normalmente se ejecuta con `sudo`).
+- El kernel debe exponer el tracepoint `syscalls:sys_enter_openat`.
+- En instalaciones de BCC que compilan contra el kernel local pueden hacer
+  falta los encabezados de ese kernel.
 
-Estamos accediendo al canal que conecta los eventos de eBPF con Python.
-
-Le estamos diciendo:
-
-> "Cuando llegue un evento desde `events`, ejecuta la función `print_event`."
-
-Visualmente:
-
-```text
-eBPF
- |
- | events.perf_submit()
- v
-events
- |
- | evento
- v
-print_event()
- |
- v
-Python
-```
-
----
-
-# 33. Iniciar el monitor
-
-Finalmente:
-
-```python
-print("Watching file access...\n")
-```
-
-simplemente muestra un mensaje indicando que el monitor comenzó.
-
-Después:
-
-```python
-while True:
-    try:
-        b.perf_buffer_poll()
-    except KeyboardInterrupt:
-        break
-```
-
-esperamos eventos.
-
-`perf_buffer_poll()` mantiene a Python esperando nuevos eventos.
-
-Cuando alguien ejecuta:
+Ejecuta el script desde el directorio `files`, ya que `monitor.py` abre
+`files_access.c` con una ruta relativa:
 
 ```bash
-cat /etc/hosts
-```
-
-ocurre aproximadamente esto:
-
-```text
-cat
- |
- | openat("/etc/hosts")
- v
-Linux Kernel
- |
- | tracepoint
- v
-eBPF
- |
- | crea event
- v
-BPF_PERF_OUTPUT
- |
- v
-Python
- |
- v
-print_event()
- |
- v
-1234 cat /etc/hosts
-```
-
----
-
-# 34. Probando el programa
-
-Primero ejecutamos nuestro monitor.
-
-Dependiendo de la configuración de Linux y BCC, probablemente necesitaremos privilegios de root:
-
-```bash
+cd files
 sudo python3 monitor.py
 ```
 
-Deberíamos ver:
+Mientras está activo, abre archivos desde otra terminal o aplicación. El
+monitor mostrará filas similares a:
 
 ```text
-Watching file access...
-
 PID     COMMAND         FILE
 --------------------------------------------------------------------------------
+1234    bash            /etc/hosts
 ```
 
-Ahora, desde otra terminal:
-
-```bash
-cat /etc/hosts
-```
-
-Podríamos obtener:
-
-```text
-1234    cat             /etc/hosts
-```
-
-También podemos probar:
-
-```bash
-cat /etc/passwd
-```
-
-o:
-
-```bash
-cat /tmp/test.txt
-```
-
-o:
-
-```bash
-python3 -c "open('/tmp/example.txt').read()"
-```
-
-El monitor debería detectar los `openat()` correspondientes.
-
----
-
-# 35. Algo importante: estamos observando `openat()`
-
-El nombre del proyecto puede dar la impresión de que estamos detectando cualquier acceso a archivos.
-
-En realidad, esta versión está observando:
-
-```text
-sys_enter_openat
-```
-
-Por lo tanto estamos detectando procesos que entran al syscall `openat()`.
-
-Eso significa que esto:
-
-```text
-openat()
-```
-
-no necesariamente significa:
-
-```text
-read()
-```
-
-y tampoco significa:
-
-```text
-write()
-```
-
-Por ejemplo, un proceso puede abrir un archivo y nunca leerlo.
-
-Otro proceso puede tener un descriptor de archivo abierto y posteriormente utilizar:
-
-```text
-read()
-```
-
-para leer datos.
-
----
-
-# 36. ¿Qué podemos aprender de este ejemplo?
-
-Este pequeño programa demuestra varias ideas fundamentales de eBPF.
-
-## 36.1 eBPF puede observar el kernel
-
-Nuestro código Python no está leyendo directamente:
-
-```text
-/proc
-```
-
-ni está ejecutando:
-
-```bash
-ps
-```
-
-ni:
-
-```bash
-lsof
-```
-
-Estamos observando un evento que ocurre dentro del kernel.
-
----
-
-## 36.2 Podemos enganchar nuestro programa a eventos
-
-En este caso utilizamos:
-
-```c
-TRACEPOINT_PROBE(syscalls, sys_enter_openat)
-```
-
-Pero eBPF puede trabajar con muchos otros tipos de eventos y mecanismos.
-
-Por ejemplo:
-
-```text
-tracepoints
-kprobes
-uprobes
-network hooks
-etc.
-```
-
-Cada uno sirve para diferentes tipos de observabilidad.
-
----
-
-## 36.3 El programa eBPF puede recolectar información
-
-Nuestro programa obtiene:
-
-```text
-PID
-process name
-filename
-```
-
-y construye una estructura:
-
-```c
-struct event_t
-```
-
----
-
-## 36.4 Los datos pueden viajar hacia user space
-
-El kernel no imprime directamente:
-
-```text
-1234 cat /etc/hosts
-```
-
-En lugar de eso, nuestro programa eBPF envía un evento:
-
-```text
-Kernel
-   |
-   v
-BPF_PERF_OUTPUT
-   |
-   v
-Python
-```
-
-Python recibe ese evento y decide qué hacer con él.
-
-En este caso:
-
-```python
-print(...)
-```
-
----
-
-# 37. El concepto más importante del ejemplo
-
-Si estás aprendiendo eBPF, probablemente la parte más importante que debes recordar de este proyecto es esta:
-
-```text
-                 USER SPACE
-        ┌────────────────────────┐
-        │                        │
-        │       Python           │
-        │                        │
-        │    print_event()       │
-        │          ▲             │
-        └──────────┼─────────────┘
-                   │
-                   │ evento
-                   │
-        ┌──────────┼─────────────┐
-        │          │             │
-        │   BPF_PERF_OUTPUT      │
-        │                        │
-        ├────────────────────────┤
-        │                        │
-        │       KERNEL           │
-        │                        │
-        │      eBPF program      │
-        │           │            │
-        │           ▼            │
-        │ sys_enter_openat       │
-        │           │            │
-        │           ▼            │
-        │       openat()         │
-        │                        │
-        └────────────────────────┘
-```
-
-El flujo completo es:
-
-```text
-1. Un proceso llama a openat()
-2. El kernel genera el tracepoint
-3. Nuestro programa eBPF se ejecuta
-4. eBPF obtiene el PID
-5. eBPF obtiene el nombre del proceso
-6. eBPF lee el nombre del archivo
-7. eBPF crea un evento
-8. El evento pasa a BPF_PERF_OUTPUT
-9. Python recibe el evento
-10. Python convierte los bytes en una estructura
-11. Python imprime la información
-```
-
-Ese flujo es una de las ideas fundamentales para comenzar a entender eBPF.
-
----
-
-# 38. Una posible evolución
-
-Una vez que este ejemplo funciona, podemos hacerlo mucho más interesante.
-
-Por ejemplo, podemos detectar diferentes tipos de operaciones:
-
-```text
-openat()   → archivo abierto
-read()     → datos leídos
-write()    → datos escritos
-unlink()   → archivo eliminado
-rename()   → archivo renombrado
-mkdir()    → directorio creado
-```
-
-También podemos agregar filtros.
-
-Por ejemplo:
-
-```text
-solo /tmp
-solo archivos .log
-solo procesos Python
-solo un PID
-ignorar nuestro propio monitor
-```
-
-También podríamos producir información como:
-
-```text
-PID     PROCESS       OPERATION    FILE
----------------------------------------------------------
-1234    python3       OPEN         /tmp/data.json
-1234    python3       READ         /tmp/data.json
-1256    nginx         OPEN         /var/log/nginx/access.log
-1256    nginx         WRITE        /var/log/nginx/access.log
-```
-
-En ese punto el programa empieza a parecerse más a una pequeña herramienta de observabilidad del sistema.
-
----
-
-# 39. Resumen
-
-Este proyecto es pequeño, pero contiene varias piezas importantes de eBPF:
-
-```text
-Python
-  |
-  | BCC
-  v
-eBPF
-  |
-  | Tracepoint
-  v
-sys_enter_openat
-  |
-  | información
-  v
-event_t
-  |
-  | perf buffer
-  v
-Python
-```
-
-La idea fundamental es:
-
-> Python controla el programa y procesa los resultados, mientras que el programa eBPF observa los eventos desde el kernel.
-
-En este ejemplo estamos observando `openat()` para saber qué proceso está intentando abrir qué archivo.
-
-Una vez que se entiende este patrón, se puede reutilizar para construir muchos otros programas de observabilidad con eBPF.
+La línea representa que ese proceso pasó esa cadena de ruta a `openat`; no
+confirma que la apertura haya tenido éxito. Pulsa `Ctrl+C` para detener el
+monitor.
+
+## Alcance y limitaciones
+
+- Solo observa entradas a `openat`. No instrumenta explícitamente
+  `openat2`, `creat` u otros syscalls de apertura. Algunas bibliotecas o
+  herramientas implementan una apertura usando `openat`, pero no se debe
+  interpretar esto como cobertura universal de toda actividad con archivos.
+- Registra el argumento `filename`, no la ruta canónica final ni el descriptor
+  devuelto por el kernel.
+- Puede mostrar intentos fallidos porque captura el syscall antes de que
+  termine.
+- No registra el proceso que posteriormente lee, escribe, cierra o modifica el
+  archivo; tampoco captura el modo de apertura, las banderas, el resultado o
+  los datos transferidos.
+- El nombre corto del proceso y la ruta tienen tamaños fijos. El nombre puede
+  ser limitado y la ruta puede truncarse a 255 bytes de contenido, más el
+  terminador nulo.
+- El callback no valida el argumento `size` antes de interpretar el puntero
+  como `Event`.
+- El texto de ruta se lee desde memoria de usuario. Si esa lectura falla, el
+  código actual no expone una indicación explícita del error.

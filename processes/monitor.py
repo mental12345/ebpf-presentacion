@@ -17,7 +17,7 @@ class Event(ct.Structure):
     _fields_ = [
         ("pid", ct.c_uint),
         ("ppid", ct.c_uint),
-        ("comm", ct.c_char * 64),
+        ("comm", ct.c_char * 16),
     ]
 
 
